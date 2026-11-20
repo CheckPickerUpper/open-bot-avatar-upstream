@@ -14,11 +14,20 @@
  *   does projection and occlusion. Each visible slice costs a compositor layer,
  *   so mountAvatar paints live avatars to one canvas by default and only uses
  *   the scene with `renderer: 'scene'`.
+ *
+ * A state can draw more than the body (see effects.ts): ribbons behind and in front of it, and
+ * the marks a thinking or blocked bot turns into. Those stay where they are while the body hops
+ * and rolls.
  */
-import { parseHex, toHex } from './color.ts';
+import { mix, oklch, parseHex, toHex, toOklch } from './color.ts';
 import type { Rgb } from './color.ts';
-import { computePose, hashString } from './motion.ts';
-import type { Pose } from './motion.ts';
+import { bodyScale, markParts, ribbonPieces, ribbonReach, rimOf } from './effects.ts';
+import type { Rim } from './effects.ts';
+import type { Box } from './effects.ts';
+import { eyePath, plainLook } from './eyes.ts';
+import type { EyeSpot } from './eyes.ts';
+import { computePose, hashString, noise } from './motion.ts';
+import type { EyeLook, Pose } from './motion.ts';
 import type { Bounds, Point } from './path.ts';
 import { EYE_H, EYE_W, GAZE_X, GAZE_Y, HAPPY_ARC, analyzeBody, eyeCenters, gazeRange, validateAvatar } from './validate.ts';
 import type { GazeRange } from './validate.ts';
@@ -50,6 +59,8 @@ interface Prepared {
   ids: Map<string, string>;
   /** Slices kept at a rendered size, per stack, keyed by stack and rounded size. */
   detail: Map<string, boolean[]>;
+  /** Where the ribbons' hoops are centred and how far the body reaches from there (see ribbonRims). */
+  rims: () => { work: Rim; cage: Rim };
 }
 
 const cache = new Map<string, Prepared>();
@@ -63,6 +74,48 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 function depthOption(options: RenderOptions): number {
   const d = clamp(Number.isFinite(options.depth) ? (options.depth as number) : DEFAULT_DEPTH, 0, MAX_DEPTH);
   return Math.round(d * 2) / 2;
+}
+
+const lazy = <T>(make: () => T): (() => T) => {
+  let value: T | undefined;
+  return () => (value ??= make());
+};
+
+/**
+ * How far the body reaches from the middle of its box, for a working turn's hoop and for a
+ * celebration's cage. The hoops' centre hops and stretches with the body (see ribbonsFollow) but
+ * does not lean or sway with it, so each is measured over the leans its state takes, the body
+ * stretched about the centre: a working bot leans 2.4° to 6.6° and squashes to 98%; a celebrating
+ * one sways ±1.7° and stretches up to 5.5%. The hoops stand just outside that, so the body never
+ * moves through a point where a ribbon passes behind it.
+ */
+export function ribbonRims(polys: Point[][], b: Bounds): { work: Rim; cage: Rim } {
+  const [cx, cy] = pivotOf(b);
+  const bx = (b.minX + b.maxX) / 2, by = b.maxY;
+  /** The body leaned by each of `rolls` (degrees, about its base) and stretched by each of `sys` about the centre. */
+  const posed = (rolls: number[], sys: number[]) => {
+    const out: Point[][][] = [];
+    for (const roll of rolls) {
+      const r = (roll * Math.PI) / 180, c = Math.cos(r), sn = Math.sin(r);
+      for (const k of sys) {
+        out.push(polys.map((poly) => poly.map(([x, y]): Point => {
+          const lx = bx + c * (x - bx) - sn * (y - by), ly = by + sn * (x - bx) + c * (y - by);
+          return [cx + 1.01 * (lx - cx), cy + k * (ly - cy)];
+        })));
+      }
+    }
+    return out;
+  };
+  return { work: rimOf(posed([2.4, 4.5, 6.6], [0.98, 1]), cx, cy), cage: rimOf(posed([-1.7, 0, 1.7], [0.99, 1.055]), cx, cy) };
+}
+
+/**
+ * The rim moved to where the hoops' centre is in this pose: it hops and stretches with the body
+ * (the root motion's lift and scale about the base) but does not lean or sway with it.
+ */
+export function ribbonsFollow(rim: Rim, pose: Pick<Pose, 'lift' | 'sx' | 'sy'>, b: Bounds): Rim {
+  const bx = (b.minX + b.maxX) / 2, by = b.maxY;
+  return { ...rim, cx: bx + pose.sx * (rim.cx - bx), cy: by + pose.sy * (rim.cy - by) + pose.lift };
 }
 
 function prepare(definition: AvatarDefinition, depth: number): Prepared {
@@ -85,6 +138,7 @@ function prepare(definition: AvatarDefinition, depth: number): Prepared {
     id,
     ids,
     detail: new Map(),
+    rims: lazy(() => ribbonRims(body.polys, vol.bounds)),
   };
   if (cache.size >= 64) cache.delete(cache.keys().next().value as string);
   cache.set(key, prepared);
@@ -98,11 +152,13 @@ export function preparedVolume(definition: AvatarDefinition, depth?: number): { 
 }
 
 function poseOf(p: Prepared, options: RenderOptions): Pose {
-  const motion = options.motion === 'thinking' || options.motion === 'happy' ? options.motion : 'idle';
   return computePose({
     seed: p.seed,
     time: Number.isFinite(options.time) ? (options.time as number) : 0,
-    motion,
+    state: options.state,
+    mood: options.mood,
+    motion: options.motion,
+    stateAge: options.stateAge,
     gaze: options.gaze,
     reducedMotion: options.reducedMotion === true,
     view: options.view,
@@ -125,6 +181,10 @@ const mul = (m: M, n: M): M => [
 ];
 const translate = (x: number, y: number): M => [1, 0, 0, 1, x, y];
 const about = (x: number, y: number, m: M): M => mul(translate(x, y), mul(m, translate(-x, -y)));
+const invert = ([a, b, c, d, e, g]: M): M => {
+  const det = a * d - b * c;
+  return [d / det, -b / det, -c / det, a / det, (c * g - d * e) / det, (b * e - a * g) / det];
+};
 const mat = (m: M) => `matrix(${m.map((v, i) => (i < 4 ? (Math.round(v * 10000) / 10000).toString() : f(v))).join(' ')})`;
 
 export interface ViewBasis {
@@ -203,11 +263,20 @@ const POSE_SWAY = 0.2;
  * canvas renderer uses it only as an upper bound: it sizes each bitmap to what is actually painted.
  */
 export function avatarExtent(definition: AvatarDefinition, depth?: number): { x: number; y: number; size: number } {
-  const { vol } = prepare(definition, depthOption({ depth }));
+  const p = prepare(definition, depthOption({ depth }));
+  const { vol } = p;
   const b = vol.bounds;
   const [cx, cy] = pivotOf(b);
   const radius = Math.hypot(b.maxX - b.minX, b.maxY - b.minY, Math.max(...vol.parts.map((part) => part.depth)) + 2 * EYE_LIFT) / 2;
-  const half = radius + POSE_LIFT + POSE_SWAY * (radius + b.maxY - cy);
+  // Ribbons reach their hoop plus their band from the middle of the body's box, and keep the
+  // canvas's antialiasing margin (FIT_PAD) inside.
+  const { work, cage } = p.rims();
+  // The hoops' centre also hops and stretches with the body: as far as the body's own pose moves it.
+  const reach = (rim: Rim) => {
+    const r = ribbonReach(rim.max);
+    return Math.hypot(rim.cx - cx, rim.cy - cy) + POSE_LIFT + POSE_SWAY * Math.abs(b.maxY - rim.cy) + r.radius + r.band + 1.2;
+  };
+  const half = Math.max(radius + POSE_LIFT + POSE_SWAY * (radius + b.maxY - cy), reach(work), reach(cage));
   return { x: cx - half, y: cy - half, size: 2 * half };
 }
 
@@ -254,7 +323,9 @@ interface EyeState {
   /** Drawn pill height after blink/squint, and its downward shift (lids close toward a point below center). */
   open: number;
   shift: number;
-  happy: boolean;
+  look: EyeLook;
+  /** The plain pill or the plain happy arc, drawn as such; null for every other look (a path). */
+  plain: 'pill' | 'arc' | null;
 }
 
 function eyeStates(p: Prepared, pose: Pose): [EyeState, EyeState] {
@@ -264,11 +335,17 @@ function eyeStates(p: Prepared, pose: Pose): [EyeState, EyeState] {
   const dx = pose.gazeX * (pose.gazeX >= 0 ? r.right : r.left) * GAZE_X * s;
   const dy = pose.gazeY * (pose.gazeY >= 0 ? r.down : r.up) * GAZE_Y * s;
   const centers = eyeCenters(p.def.eyes);
+  const plain = plainLook(pose.eyes);
   return ([0, 1] as const).map((i) => {
     const squint = i === 0 ? pose.squintL : pose.squintR;
     const open = Math.max(h * Math.max(0.09, (1 - pose.blink) * (1 - squint * 0.4)), w * 0.55);
-    return { x: centers[i][0], y: centers[i][1], w, h, dx, dy, open, shift: (h - open) * 0.18, happy: pose.eyeShape === 'happy' };
+    return { x: centers[i][0], y: centers[i][1], w, h, dx, dy, open, shift: (h - open) * 0.18, look: pose.eyes, plain };
   }) as [EyeState, EyeState];
+}
+
+/** Where an eye is drawn: with its gaze offset, or without it where a transform applies the gaze. */
+function eyeSpot(e: EyeState, gaze: boolean): EyeSpot {
+  return { x: e.x + (gaze ? e.dx : 0), y: e.y + (gaze ? e.dy : 0), w: e.w, h: e.h, open: e.open, shift: e.shift };
 }
 
 function happyArc(e: EyeState): string {
@@ -278,7 +355,8 @@ function happyArc(e: EyeState): string {
 }
 
 function eyeMark(e: EyeState): EyeMark {
-  if (e.happy) return { shape: 'arc', d: happyArc(e), strokeWidth: e.w * HAPPY_ARC.stroke };
+  if (e.plain === 'arc') return { shape: 'arc', d: happyArc(e), strokeWidth: e.w * HAPPY_ARC.stroke };
+  if (e.plain === null) return { shape: 'path', d: eyePath(e.look, eyeSpot(e, true)) };
   const cx = e.x + e.dx, cy = e.y + e.dy + e.shift;
   return { shape: 'pill', x: cx - e.w / 2, y: cy - e.open / 2, width: e.w, height: e.open, radius: Math.min(e.w, e.open) / 2 };
 }
@@ -296,10 +374,15 @@ function colors(options: RenderOptions): { color: string; ink: string } {
 /** 2D affine matrix in SVG order (a b c d e f). */
 export type Matrix = [number, number, number, number, number, number];
 
-/** How one eye is drawn, in its face plane's coordinates (viewBox units). */
+/**
+ * How one eye is drawn, in its face plane's coordinates (viewBox units): the plain pill, the
+ * plain happy arc (stroked, round caps), or for every other look a filled outline (a waiting
+ * bot's slits, and every shape on the way from one look to the next).
+ */
 export type EyeMark =
   | { shape: 'pill'; x: number; y: number; width: number; height: number; radius: number }
-  | { shape: 'arc'; d: string; strokeWidth: number };
+  | { shape: 'arc'; d: string; strokeWidth: number }
+  | { shape: 'path'; d: string };
 
 export type FrameShape =
   | {
@@ -310,7 +393,26 @@ export type FrameShape =
       path: string;
       matrix: Matrix;
     }
-  | { kind: 'eye'; key: 'eye-0' | 'eye-1'; matrix: Matrix; mark: EyeMark };
+  | { kind: 'eye'; key: 'eye-0' | 'eye-1'; matrix: Matrix; mark: EyeMark }
+  | {
+      /**
+       * A piece of a ribbon: fill `d` in `fill`. Each ribbon has a hue of its own, set apart from
+       * the body's; a piece `front` of the body is lighter than one behind it.
+       */
+      kind: 'ribbon';
+      key: string;
+      d: string;
+      box: { x: number; y: number; w: number; h: number };
+      matrix: Matrix;
+      front: boolean;
+      /** The ribbon's colour where it is plainest (the middle of its gradient). */
+      fill: string;
+      /**
+       * A linear gradient along the whole ribbon, in the same coordinates as `d`: from its tail
+       * (x1, y1) to its head (x2, y2), the stops evenly spaced. Every piece of a ribbon shares it.
+       */
+      gradient: { x1: number; y1: number; x2: number; y2: number; stops: string[] };
+    };
 
 /** One cross-section outline, shared by every shape that draws it. */
 export interface FramePath {
@@ -322,7 +424,9 @@ export interface FramePath {
 
 /**
  * One frame of the avatar flattened onto the screen: every cross-section the
- * view draws with its projection, and the visible eyes, sorted back to front.
+ * view draws with its projection, and the visible eyes, sorted back to front,
+ * between the ribbons behind the body and those in front of it. The marks of
+ * `thinking` and `blocked` are listed as slices too, in place of the body.
  * Painting them in order (body paths in `color`, eyes in `ink`) inside the
  * `root` transform and a 0 0 100 100 viewBox gives the avatar exactly as
  * renderAvatarSvg draws it. Plain numbers and path strings, so any vector
@@ -357,6 +461,133 @@ export function liveFrame(definition: AvatarDefinition, options: RenderOptions =
   return flatFrame(definition, options, options.size);
 }
 
+/**
+ * The ribbons are steps along a ramp of the body's own color, painter's style: each step is
+ * RAMP_LIGHT lighter or darker in OKLCH and turns RAMP_HUE degrees with it, toward yellow as it
+ * lightens and toward blue as it darkens. Steps run +1, -1, +2, -2 and so on, skipping any that
+ * would leave RAMP_RANGE, so a working bot's three are one lighter, one darker and one lighter
+ * still on most bodies. A body lighter or darker than the range steps from its edge instead, so
+ * a white body's ribbons are all well darker than it, and a black one's well lighter.
+ */
+const RAMP_LIGHT = 0.09;
+const RAMP_HUE = 14;
+// Six steps wide: room for five besides the body's own, wherever it starts. Past it shades wash
+// out toward white or sink toward black.
+const RAMP_RANGE = [0.36, 0.9] as const;
+const WARM = 100;
+const palettes = new Map<string, Rgb[][]>();
+/**
+ * How far a ribbon's colour runs from its tail (its shade) to its head: further from the body's
+ * lightness by GRADIENT_LIGHT, turning GRADIENT_HUE degrees with it (warmer as it lightens,
+ * cooler as it darkens). GRADIENT_STOPS colours along the way.
+ */
+const GRADIENT_LIGHT = 0.13;
+const GRADIENT_HUE = 25;
+const GRADIENT_STOPS = 5;
+/** Below this chroma a body counts as white, gray or black, and its ribbons are grays with this much tint. */
+const NEUTRAL = 0.04;
+const NEUTRAL_TINT = 0.025;
+/**
+ * Which shades (by their order along the ramp: +1, -1, +2, -2, +3 on most bodies) each band's lanes
+ * take, a working bot's band first. A celebration's two bands lean to the lighter shades, so the
+ * cage stays bright against a dark page.
+ */
+const BAND_SHADES = [[0, 1, 2], [2, 0, 3], [1, 2, 0]] as const;
+
+/** Turn hue `h` by up to `by` degrees toward hue `to`, never past it. */
+function turnToward(h: number, to: number, by: number): number {
+  const d = ((to - h + 540) % 360) - 180;
+  return (h + Math.sign(d) * Math.min(Math.abs(d), by) + 360) % 360;
+}
+
+/**
+ * The colors of the ribbons on a body this color, one per band and lane (see BAND_SHADES): five
+ * steps along its own ramp (see RAMP_LIGHT), at least as vivid as the body. A white, gray or
+ * black body gets grays: lighter or darker than it, with just a hint of a hue its seed picks.
+ * A piece behind the body is a shade deeper than one in front of it.
+ */
+/** The colour `t` (0..1) of the way along a colour run, in sRGB between its stops. */
+function runAt(run: Rgb[], t: number): string {
+  const x = clamp(t, 0, 1) * (run.length - 1), n = Math.min(Math.floor(x), run.length - 2);
+  return toHex(mix(run[n], run[n + 1], x - n));
+}
+
+function ribbonPalette(color: string | undefined, seed: number): Rgb[][] {
+  const key = `${color}|${seed}`;
+  let palette = palettes.get(key);
+  if (palette) return palette;
+  const [light, chroma, hue] = toOklch(parseHex(color) ?? (parseHex(DEFAULT_COLOR) as Rgb));
+  // A seed's hue skips the yellows (80 to 130), whose darker steps turn olive.
+  const neutral = chroma < NEUTRAL;
+  const base = neutral ? (130 + noise(seed, 500) * 310) % 360 : hue;
+  const c = neutral ? NEUTRAL_TINT : Math.max(chroma, 0.17);
+  const from = Math.min(RAMP_RANGE[1], Math.max(RAMP_RANGE[0], light));
+  const steps: number[] = [];
+  for (let k = 1; steps.length < 5 && k < 10; k++) {
+    for (const step of [k, -k]) {
+      const l = from + step * RAMP_LIGHT;
+      if (steps.length < 5 && l >= RAMP_RANGE[0] - 1e-9 && l <= RAMP_RANGE[1] + 1e-9) steps.push(step);
+    }
+  }
+  while (steps.length < 5) steps.push(steps[steps.length - 1] ?? 1);
+  const shades = steps.map((step) => {
+    const l = from + step * RAMP_LIGHT;
+    const h = turnToward(base, step > 0 ? WARM : WARM + 180, RAMP_HUE * Math.abs(step));
+    // Tail to head, away from the body's lightness: lighter and warmer, or darker and cooler.
+    const away = step > 0 ? 1 : -1;
+    const run = Array.from({ length: GRADIENT_STOPS }, (_, n) => {
+      const t = n / (GRADIENT_STOPS - 1);
+      const hue = turnToward(h, away > 0 ? WARM : WARM + 180, GRADIENT_HUE * t);
+      return oklch(clamp(l + away * GRADIENT_LIGHT * t, 0.26, 0.9), c, hue);
+    });
+    return { step, run };
+  });
+  // Each band takes three of the shades, lightest on the inside lane to darkest on the outside.
+  palette = BAND_SHADES.flatMap((pick) => pick.map((n) => shades[n]).sort((x, y) => y.step - x.step).map(({ run }) => run));
+  if (palettes.size >= 64) palettes.clear();
+  palettes.set(key, palette);
+  return palette;
+}
+
+/** What a frame draws besides the body, in viewBox units outside the body's own motion. */
+interface Effects {
+  /** How much of its size the body keeps while it gives way to a mark (0 = gone). */
+  body: number;
+  ribbons: { d: string; box: Box; front: boolean; fill: string; gradient: RibbonGradient }[];
+  marks: { id: string; d: string; box: Box; matrix: M }[];
+}
+
+function effectsOf(p: Prepared, pose: Pose, options: RenderOptions): Effects {
+  const b = p.vol.bounds;
+  const time = Number.isFinite(options.time) ? (options.time as number) : 0;
+  const still = options.reducedMotion === true;
+  const [cx, cy] = pivotOf(b);
+  return {
+    body: bodyScale(pose.bang, pose.dots),
+    ribbons: still ? [] : ribbonPieces(b, pose.ribbons, p.seed, time, pose.sweep, pose.cage, ribbonsFollow(pose.cage >= 0.5 ? p.rims().cage : p.rims().work, pose, b)).map((r) => {
+      const hue = ribbonPalette(options.color, p.seed)[r.ribbon];
+      // The piece's stretch of its ribbon's colour run, front and back alike.
+      const [s0, s1] = r.along;
+      const stops = [s0, (s0 + s1) / 2, s1].map((t) => runAt(hue, t));
+      // A gradient needs some length; a piece too short to have one takes its middle colour.
+      const long = Math.hypot(r.to[0] - r.from[0], r.to[1] - r.from[1]) > 0.01;
+      return {
+        d: r.d, box: r.box, front: r.front, fill: stops[1],
+        gradient: long ? { x1: r.from[0], y1: r.from[1], x2: r.to[0], y2: r.to[1], stops } : { x1: r.from[0], y1: r.from[1], x2: r.from[0] + 0.01, y2: r.from[1], stops: [stops[1], stops[1], stops[1]] },
+      };
+    }),
+    marks: markParts(b, pose.bang, pose.dots, p.seed, time, still).map((part) => {
+      const turn: M = [Math.cos(part.turn), Math.sin(part.turn), -Math.sin(part.turn), Math.cos(part.turn), 0, 0];
+      return {
+        id: `${p.id}-${part.shape}`,
+        d: part.d,
+        box: part.box,
+        matrix: mul(about(cx, cy, turn), mul(translate(part.x, part.y), [part.scale, 0, 0, part.scale, 0, 0])),
+      };
+    }),
+  };
+}
+
 function flatFrame(definition: AvatarDefinition, options: RenderOptions, size: number | undefined): AvatarFrame {
   const p = prepare(definition, depthOption(options));
   const { vol } = p;
@@ -367,43 +598,79 @@ function flatFrame(definition: AvatarDefinition, options: RenderOptions, size: n
   const v = viewBasis(pose.yaw, pose.pitch);
   const stack = activeStack(v);
   const eyesMid: Point = [p.def.eyes.x, p.def.eyes.y];
+  const fx = effectsOf(p, pose, options);
+  const root = rootMatrix(pose, b);
+  // The body shrinks toward its center as it gives way to a mark.
+  const shrink = (m: M): M => (fx.body < 1 ? mul(about(pivot[0], pivot[1], [fx.body, 0, 0, fx.body, 0, 0]), m) : m);
 
   // Only the cross-sections this view draws are listed; ids are stable across frames.
   const paths = new Map<string, FramePath>();
   const items: { depth: number; shape: FrameShape }[] = [];
-  drawnSlices(p, v, size, (s, m, i, j) => {
-    let path = paths.get(s.d);
-    if (!path) {
-      path = { id: p.ids.get(s.d) as string, d: s.d, evenOdd: s.evenOdd, box: { ...s.box } };
-      paths.set(s.d, path);
-    }
-    // Depth keys are taken under the eyes for the eye part, so only depth decides eye-vs-body order there.
-    const [rx, ry] = i === vol.eyePart ? eyesMid : vol.parts[i].center;
-    const depth = stack === 'z' ? projectPoint(v, [rx, ry, s.at], pivot)[2] : projectPoint(v, [s.at, ry, 0], pivot)[2];
-    items.push({ depth, shape: { kind: 'slice', key: `${i}${stack}${j}`, path: path.id, matrix: m } });
+  if (fx.body > 0) {
+    drawnSlices(p, v, size, (s, m, i, j) => {
+      let path = paths.get(s.d);
+      if (!path) {
+        path = { id: p.ids.get(s.d) as string, d: s.d, evenOdd: s.evenOdd, box: { ...s.box } };
+        paths.set(s.d, path);
+      }
+      // Depth keys are taken under the eyes for the eye part, so only depth decides eye-vs-body order there.
+      const [rx, ry] = i === vol.eyePart ? eyesMid : vol.parts[i].center;
+      const depth = stack === 'z' ? projectPoint(v, [rx, ry, s.at], pivot)[2] : projectPoint(v, [s.at, ry, 0], pivot)[2];
+      items.push({ depth, shape: { kind: 'slice', key: `${i}${stack}${j}`, path: path.id, matrix: shrink(m) } });
+    });
+    // Painted on the surface; each eye goes once the surface under it turns away.
+    eyeStates(p, pose).forEach((e, idx) => {
+      if (eyeVisible(vol, v, idx)) {
+        const z = vol.eyeZ[idx] + EYE_LIFT;
+        items.push({
+          depth: projectPoint(v, [eyesMid[0], eyesMid[1], z], pivot)[2] + 1e-6,
+          shape: { kind: 'eye', key: idx === 0 ? 'eye-0' : 'eye-1', matrix: shrink(planeMatrix(v, z, pivot)), mark: eyeMark(e) },
+        });
+      }
+    });
+    items.sort((a, c) => a.depth - c.depth);
+  }
+
+  // Ribbons and marks stay put while the body moves: their matrices undo the root's motion.
+  const fixed = fx.ribbons.length || fx.marks.length ? invert(root) : null;
+  const ribbon = (front: boolean): FrameShape[] =>
+    fx.ribbons.flatMap((r, i) =>
+      r.front === front ? [{ kind: 'ribbon' as const, key: `ribbon-${i}`, d: r.d, box: r.box, matrix: fixed as M, front, fill: r.fill, gradient: r.gradient }] : [],
+    );
+  const marks = fx.marks.map((mark, i): FrameShape => {
+    if (!paths.has(mark.id)) paths.set(mark.id, { id: mark.id, d: mark.d, evenOdd: false, box: mark.box });
+    return { kind: 'slice', key: `mark-${i}`, path: mark.id, matrix: mul(fixed as M, mark.matrix) };
   });
-  // Painted on the surface; each eye goes once the surface under it turns away.
-  eyeStates(p, pose).forEach((e, idx) => {
-    if (eyeVisible(vol, v, idx)) {
-      const z = vol.eyeZ[idx] + EYE_LIFT;
-      items.push({
-        depth: projectPoint(v, [eyesMid[0], eyesMid[1], z], pivot)[2] + 1e-6,
-        shape: { kind: 'eye', key: idx === 0 ? 'eye-0' : 'eye-1', matrix: planeMatrix(v, z, pivot), mark: eyeMark(e) },
-      });
-    }
-  });
-  items.sort((a, c) => a.depth - c.depth);
-  return { name: p.def.name, color, ink, paths: [...paths.values()], root: rootMatrix(pose, b), shapes: items.map((it) => it.shape) };
+  return {
+    name: p.def.name, color, ink, paths: [...paths.values()], root,
+    shapes: [...ribbon(false), ...items.map((it) => it.shape), ...ribbon(true), ...marks],
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Standalone SVG still
 
 function eyeSvg(mark: EyeMark, ink: string): string {
+  if (mark.shape === 'path') return `<path d="${mark.d}" fill="${ink}"/>`;
   if (mark.shape === 'arc') {
     return `<path d="${mark.d}" fill="none" stroke="${ink}" stroke-width="${f(mark.strokeWidth)}" stroke-linecap="round"/>`;
   }
   return `<rect x="${f(mark.x)}" y="${f(mark.y)}" width="${f(mark.width)}" height="${f(mark.height)}" rx="${f(mark.radius)}" fill="${ink}"/>`;
+}
+
+type RibbonGradient = { x1: number; y1: number; x2: number; y2: number; stops: string[] };
+
+/**
+ * A ribbon piece with its gradient alongside it. The id is taken from the gradient itself, so
+ * repeats on a page (the same avatar at the same moment) share one harmlessly.
+ */
+function ribbonSvg(d: string, g: RibbonGradient): string {
+  const id = `oba-g${hashString(`${f(g.x1)},${f(g.y1)},${f(g.x2)},${f(g.y2)},${g.stops.join()}`).toString(36)}`;
+  const stops = g.stops.map((c, i) => `<stop offset="${f(i / (g.stops.length - 1))}" stop-color="${c}"/>`).join('');
+  return (
+    `<linearGradient id="${id}" gradientUnits="userSpaceOnUse" x1="${f(g.x1)}" y1="${f(g.y1)}" x2="${f(g.x2)}" y2="${f(g.y2)}">${stops}</linearGradient>` +
+    `<path d="${d}" fill="url(#${id})"/>`
+  );
 }
 
 /** Render a definition to a standalone SVG string. Throws if the definition is invalid. */
@@ -411,7 +678,11 @@ export function renderAvatarSvg(definition: AvatarDefinition, options: RenderOpt
   const frame = avatarFrame(definition, options);
   const defsMarkup = frame.paths.map((d) => `<path id="${d.id}" d="${d.d}"${d.evenOdd ? ' fill-rule="evenodd"' : ''}/>`).join('');
   const body = frame.shapes
-    .map((s) => (s.kind === 'slice' ? `<use href="#${s.path}" transform="${mat(s.matrix)}"/>` : `<g transform="${mat(s.matrix)}">${eyeSvg(s.mark, frame.ink)}</g>`))
+    .map((s) =>
+      s.kind === 'slice' ? `<use href="#${s.path}" transform="${mat(s.matrix)}"/>`
+      : s.kind === 'eye' ? `<g transform="${mat(s.matrix)}">${eyeSvg(s.mark, frame.ink)}</g>`
+      : `<g transform="${mat(s.matrix)}">${ribbonSvg(s.d, s.gradient)}</g>`,
+    )
     .join('');
   const size = Number.isFinite(options.size) && (options.size as number) > 0 ? f(clamp(options.size as number, 8, 4096)) : null;
   const dims = size ? ` width="${size}" height="${size}"` : '';
@@ -448,6 +719,9 @@ function sliceMarkup(s: VolumeSlice): string {
   );
 }
 
+const overlay = (side: 'back' | 'front') =>
+  `<svg data-fx="${side}" viewBox="0 0 100 100" style="${FILL}overflow:visible;pointer-events:none" fill="currentColor" aria-hidden="true"></svg>`;
+
 /**
  * Static markup of the live scene for a definition and depth. Mount it once,
  * then apply `sceneFrame` every frame. Body color comes from CSS `color` on
@@ -470,16 +744,23 @@ export function renderAvatarScene(definition: AvatarDefinition, options: Pick<Re
       `<i style="position:absolute;inset:0;border-radius:999px;background:${ink}"></i>` +
       `<svg viewBox="${f(e.x - e.w / 2)} ${f(e.y - e.h / 2)} ${f(e.w)} ${f(e.h)}" style="${FILL}overflow:visible;display:none" aria-hidden="true">` +
       `<path d="${happyArc(e)}" fill="none" stroke="${ink}" stroke-width="${f(e.w * HAPPY_ARC.stroke)}" stroke-linecap="round"/></svg>` +
+      // Every look between the pill and the arc: its outline is written each frame it changes.
+      `<svg data-morph viewBox="${f(e.x - e.w / 2)} ${f(e.y - e.h / 2)} ${f(e.w)} ${f(e.h)}" style="${FILL}overflow:visible;display:none" aria-hidden="true">` +
+      `<path fill="${ink}"/></svg>` +
       `</div>`
     );
   });
   return (
     `<div data-avatar-scene="${p.id}" style="position:relative;width:100%;height:100%;container-type:size">` +
+    // Ribbons behind the body; they and the marks are written each frame they show.
+    overlay('back') +
     // will-change pins the slices' raster scale: without it every hop and squash re-rasterizes each slice.
     `<div data-motion style="${FILL}will-change:transform;transform-origin:${u((b.minX + b.maxX) / 2)} ${u(b.maxY)}">` +
     `<div data-view style="${FILL}transform-style:preserve-3d;transform-origin:${u(cx)} ${u(cy)}">` +
     stack('z') + stack('x') + eyes.join('') +
-    `</div></div></div>`
+    `</div></div>` +
+    overlay('front') +
+    `</div>`
   );
 }
 
@@ -488,12 +769,18 @@ export interface SceneFrame {
   scene: string;
   /** 2D motion (hop, roll, squash) about the base of the body. */
   motion: string;
-  /** 3D view rotation about the body center. */
+  /** 3D view rotation about the body center, scaled down while the body gives way to a mark. */
   view: string;
+  /** How much of its size the body keeps, 0..1; at 0 the view needs no layers. */
+  body: number;
+  /** Markup for the scene's two overlays (`data-fx`): ribbons behind the body; ribbons and marks in front. */
+  back: string;
+  front: string;
   stack: 'z' | 'x';
   /** Per slice of the active stack, in markup order: whether it shows. Hidden ones need no layer. */
   slices: boolean[];
-  eyes: { visible: boolean; happy: boolean; transform: string; pill: string }[];
+  /** `d` is set while the eye is between the pill and the arc: it then shows the `data-morph` path alone. */
+  eyes: { visible: boolean; happy: boolean; transform: string; pill: string; d: string }[];
 }
 
 const r4 = (n: number) => Math.round(n * 10000) / 10000;
@@ -536,18 +823,24 @@ export function sceneFrame(definition: AvatarDefinition, options: RenderOptions 
   const stack = activeStack(v);
   const drawn = sliceCull(v);
   const kept = sliceDetail(p, stack, options.size);
+  const fx = effectsOf(p, pose, options);
+  const piece = (front: boolean) => fx.ribbons.filter((r) => r.front === front).map((r) => ribbonSvg(r.d, r.gradient)).join('');
   let k = 0;
   return {
     scene: p.id,
     motion: `translate(0,${u(pose.lift)}) rotate(${f(pose.roll)}deg) scale(${r4(pose.sx)},${r4(pose.sy)})`,
-    view: `rotateX(${r4(pose.pitch)}rad) rotateY(${r4(pose.yaw)}rad)`,
+    view: (fx.body < 1 ? `scale(${r4(fx.body)}) ` : '') + `rotateX(${r4(pose.pitch)}rad) rotateY(${r4(pose.yaw)}rad)`,
+    body: fx.body,
+    back: piece(false),
+    front: piece(true) + fx.marks.map((mark) => `<path d="${mark.d}" transform="${mat(mark.matrix)}"/>`).join(''),
     stack,
     slices: p.vol.parts.flatMap((part) => (stack === 'z' ? part.zSlices : part.xSlices).map((s) => kept[k++] && drawn(s))),
     eyes: states.map((e, i) => ({
       visible: eyeVisible(p.vol, v, i),
-      happy: e.happy,
+      happy: e.plain === 'arc',
       transform: `translateZ(${u(p.vol.eyeZ[i] + EYE_LIFT)}) translate(${u(e.dx)},${u(e.dy)})`,
       pill: `translateY(${u(e.shift)}) scaleY(${r4(e.open / e.h)})`,
+      d: e.plain === null ? eyePath(e.look, eyeSpot(e, false)) : '',
     })),
   };
 }

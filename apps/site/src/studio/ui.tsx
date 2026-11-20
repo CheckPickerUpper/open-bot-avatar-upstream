@@ -190,3 +190,10 @@ export function MenuButton({ icon, label, items, done, placement = "top" }: { ic
     </div>
   );
 }
+
+export interface Choice<T extends string> {
+  value: T;
+  label: string;
+  /** One line on what it shows. */
+  hint: string;
+}

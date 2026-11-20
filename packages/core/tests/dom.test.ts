@@ -33,6 +33,39 @@ describe('mountAvatar', () => {
     expect(el.innerHTML).toBe('');
   });
 
+  it('shows ribbons, marks and morphing eyes in the scene, and still takes the old mood values', async () => {
+    const el = document.createElement('div');
+    document.body.append(el);
+    const avatar = mountAvatar(el, { definition: examples[0], state: 'working', reducedMotion: false });
+    const fx = (side: string) => el.querySelector(`[data-fx="${side}"]`) as Element;
+    // A working bot's first sweep comes a second or two after it starts.
+    const shown = () => (fx('back')?.children.length ?? 0) + (fx('front')?.children.length ?? 0);
+    for (let i = 0; i < 240 && !shown(); i++) await frame();
+    expect(shown()).toBeGreaterThan(0);
+    // Each ribbon filled with a gradient of its own, in colours that are not the body's.
+    const fills = [...el.querySelectorAll('[data-fx] path')].map((path) => path.getAttribute('fill') ?? '');
+    expect(fills.every((fill) => /^url\(#oba-g[0-9a-z]+\)$/.test(fill))).toBe(true);
+    const stops = [...el.querySelectorAll('[data-fx] linearGradient stop')].map((stop) => stop.getAttribute('stop-color') ?? '');
+    expect(stops.length).toBeGreaterThan(0);
+    expect(stops.every((c) => /^#[0-9a-f]{6}$/.test(c))).toBe(true);
+
+    avatar.update({ state: 'idle', mood: 'happy' });
+    await frame();
+    await frame();
+    await frame();
+    // Part way from the pill to the arc, an eye is its morphing outline.
+    const morph = el.querySelector('[data-morph]') as HTMLElement;
+    expect(morph.style.display).toBe('block');
+    expect(morph.querySelector('path')?.getAttribute('d')).toMatch(/^M/);
+
+    // `mood: 'thinking'` meant the thinking state before `state` existed. Reduced motion switches at once.
+    avatar.update({ state: undefined, mood: 'thinking', reducedMotion: true });
+    await frame();
+    expect(fx('front').querySelectorAll('path').length).toBe(3);
+    expect((el.querySelector('[data-view]') as HTMLElement).style.display).toBe('none');
+    avatar.destroy();
+  });
+
   it('renders a still as one SVG and can be decorative', async () => {
     const el = document.createElement('div');
     document.body.append(el);

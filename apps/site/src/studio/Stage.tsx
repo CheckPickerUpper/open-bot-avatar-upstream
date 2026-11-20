@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
-import type { AvatarDefinition, AvatarMotion } from "open-bot-avatar";
+import type { AvatarDefinition, AvatarMood, AvatarState } from "open-bot-avatar";
 import { BotAvatar } from "../BotAvatar";
 import { Icon } from "./ui";
+import { FaceToggle, MOODS, STATES, StatePills } from "./pickers";
 
 export type ViewAngle = { yaw: number; pitch: number };
 
 interface StageProps {
   definition: AvatarDefinition;
   color: string;
-  mood: AvatarMotion;
+  state: AvatarState;
+  mood: AvatarMood;
   followCursor: boolean;
   /** Forced on or off, or "system" to follow prefers-reduced-motion. */
   reducedMotion: boolean | "system";
@@ -16,29 +18,27 @@ interface StageProps {
   reduced: boolean;
   view: ViewAngle;
   onView: (view: ViewAngle) => void;
-  onMotion: (motion: AvatarMotion) => void;
-  /** Shown under the moods (the avatar's actions). */
+  onState: (state: AvatarState) => void;
+  onMood: (mood: AvatarMood) => void;
+  /** Shown under the state and mood (the avatar's actions). */
   children?: ReactNode;
 }
-
-const MOODS: { value: AvatarMotion; label: string }[] = [
-  { value: "idle", label: "Idle" },
-  { value: "thinking", label: "Thinking" },
-  { value: "happy", label: "Happy" },
-];
 
 const PITCH_LIMIT = 0.9;
 const clampPitch = (p: number) => Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, p));
 /** Keep yaw in -π..π so a reset never spins the long way round. */
 const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 
-export function Stage({ definition, color, mood, followCursor, reducedMotion, reduced, view, onView, onMotion, children }: StageProps) {
+export function Stage({ definition, color, state, mood, followCursor, reducedMotion, reduced, view, onView, onState, onMood, children }: StageProps) {
   const drag = useRef<{ id: number; x: number; y: number; start: ViewAngle } | null>(null);
   const [dragging, setDragging] = useState(false);
   const easing = useRef(0);
   const turned = Math.abs(view.yaw) > 0.01 || Math.abs(view.pitch) > 0.01;
 
   useEffect(() => () => cancelAnimationFrame(easing.current), []);
+
+  // What a key on the preview just picked, for screen readers.
+  const [said, setSaid] = useState("");
 
   const reset = () => {
     cancelAnimationFrame(easing.current);
@@ -78,6 +78,24 @@ export function Stage({ definition, color, mood, followCursor, reducedMotion, re
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // 1–6 pick a state, M (Shift+M backwards) the next mood.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      const pick = /^[1-9]$/.test(e.key) ? STATES[Number(e.key) - 1] : undefined;
+      if (pick) {
+        e.preventDefault();
+        onState(pick.value);
+        setSaid(pick.label);
+        return;
+      }
+      if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        const at = MOODS.findIndex((m) => m.value === mood);
+        const next = MOODS[(at + (e.shiftKey ? -1 : 1) + MOODS.length) % MOODS.length];
+        onMood(next.value);
+        setSaid(`${next.label} mood`);
+        return;
+      }
+    }
     const step = e.shiftKey ? 0.6 : 0.2;
     const moves: Record<string, ViewAngle> = {
       ArrowLeft: { yaw: view.yaw - step, pitch: view.pitch },
@@ -97,62 +115,60 @@ export function Stage({ definition, color, mood, followCursor, reducedMotion, re
     onView({ yaw: wrap(next.yaw), pitch: next.pitch });
   };
 
+  const preview = (
+    <div
+      className={dragging ? "stage-view is-dragging" : "stage-view"}
+      tabIndex={0}
+      role="group"
+      aria-roledescription="3D preview"
+      aria-label={`${definition.name}. Drag or use arrow keys to turn; Home resets the view; 1 to 6 pick a state; M changes the mood.`}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onDoubleClick={reset}
+      onKeyDown={onKeyDown}
+    >
+      <BotAvatar
+        className="avatar-view stage-avatar"
+        definition={definition}
+        color={color}
+        state={state}
+        mood={mood}
+        view={view}
+        followPointer={followCursor}
+        holdGaze={dragging}
+        reducedMotion={reducedMotion}
+        label=""
+      />
+      <FaceToggle mood={mood} onMood={onMood} />
+      <button
+        type="button"
+        className="stage-reset"
+        onClick={reset}
+        onPointerDown={(e) => e.stopPropagation()}
+        aria-label="Reset view"
+        title="Reset view"
+        hidden={!turned}
+        tabIndex={turned ? 0 : -1}
+      >
+        <Icon name="rotate" />
+      </button>
+    </div>
+  );
+
   return (
     <section className="stage" aria-label={`${definition.name} preview`}>
       {/* The avatar's name, for screen readers only: the picker shows which one it is. */}
       <h1 className="sr-only">{definition.name}</h1>
-      <div
-        className={dragging ? "stage-view is-dragging" : "stage-view"}
-        tabIndex={0}
-        role="group"
-        aria-roledescription="3D preview"
-        aria-label={`${definition.name}. Drag or use arrow keys to turn; Home resets the view.`}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onDoubleClick={reset}
-        onKeyDown={onKeyDown}
-      >
-        <BotAvatar
-          className="avatar-view stage-avatar"
-          definition={definition}
-          color={color}
-          mood={mood}
-          view={view}
-          followPointer={followCursor}
-          holdGaze={dragging}
-          reducedMotion={reducedMotion}
-          label=""
-        />
-        <button
-          type="button"
-          className="stage-reset"
-          onClick={reset}
-          onPointerDown={(e) => e.stopPropagation()}
-          aria-label="Reset view"
-          title="Reset view"
-          hidden={!turned}
-          tabIndex={turned ? 0 : -1}
-        >
-          <Icon name="rotate" />
-        </button>
-      </div>
-      <div className="moods" role="radiogroup" aria-label="Mood">
-        {MOODS.map((m) => (
-          <button
-            key={m.value}
-            type="button"
-            role="radio"
-            aria-checked={mood === m.value}
-            className={mood === m.value ? "mood is-on" : "mood"}
-            onClick={() => onMotion(m.value)}
-          >
-            {m.label}
-          </button>
-        ))}
+      {preview}
+      <div className="stage-picks">
+        <StatePills state={state} onState={onState} />
       </div>
       {children}
+      <span className="sr-only" role="status">
+        {said}
+      </span>
     </section>
   );
 }

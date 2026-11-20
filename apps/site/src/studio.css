@@ -145,25 +145,10 @@
       background: var(--hover);
     }
 
-    .moods {
+    /* State pills under the stage. */
+    .stage-picks {
       display: flex;
-      gap: 2px;
-    }
-
-    .mood {
-      padding: 4px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      color: var(--faint);
-    }
-
-    .mood:hover {
-      color: var(--muted);
-    }
-
-    .mood.is-on {
-      color: var(--text);
-      background: #1c1c1c;
+      justify-content: center;
     }
 
     /* Picker card */
@@ -1243,11 +1228,6 @@
         aspect-ratio: 1;
       }
 
-      .mood {
-        padding: 4px 10px;
-        font-size: 12.5px;
-      }
-
       .picker {
         min-width: 0;
         display: flex;
@@ -1348,17 +1328,6 @@
           padding: 8px 10px 10px 12px;
         }
 
-        .moods {
-          flex-direction: column;
-          align-items: center;
-          gap: 0;
-        }
-
-        .mood {
-          padding: 2px 8px;
-          font-size: 11.5px;
-        }
-
         .tabs {
           padding: 4px;
         }
@@ -1425,11 +1394,6 @@
           width: var(--avatar);
         }
 
-        .mood {
-          padding: 6px 14px;
-          font-size: 14px;
-        }
-
         /* One size whatever the tab shows; its content scrolls inside. */
         .picker {
           grid-area: picker;
@@ -1487,6 +1451,108 @@
         .json-input {
           --lines-max: 12;
         }
+      }
+    }
+
+    /* The state: a radio group of words under the preview. */
+
+    .pills {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 2px;
+    }
+
+    .pill {
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .pill:hover {
+      color: var(--text);
+    }
+
+    .pill.is-on {
+      color: var(--text);
+      background: var(--card);
+      box-shadow: inset 0 0 0 1px var(--line-strong);
+    }
+
+    /* Six states as a 3 × 2 block on a phone instead of 5 + 1. */
+    @media (max-width: 480px) {
+      .pills-states {
+        display: grid;
+        grid-template-columns: repeat(3, auto);
+      }
+    }
+
+    /* The mood: a toggle of eyes in the preview's corner. */
+
+    .face-toggle {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      z-index: 3;
+      cursor: default;
+    }
+
+    .face-segmented {
+      display: flex;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 999px;
+      background: #181818;
+      border: 1px solid var(--line);
+    }
+
+    .face-option {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 28px;
+      border-radius: 999px;
+      color: var(--faint);
+    }
+
+    .face-option:hover {
+      color: var(--muted);
+    }
+
+    .face-option.is-on {
+      color: var(--text);
+      background: var(--raised);
+    }
+
+    .eyes-glyph {
+      width: 18px;
+      height: 18px;
+    }
+
+    /* The short, embedded layout: smaller pills on one line. */
+    @media (max-height: 560px) and (min-aspect-ratio: 5/4) {
+      .pill {
+        padding: 3px 9px;
+        font-size: 12px;
+      }
+
+      .pills-states {
+        display: flex;
+      }
+    }
+
+    @media (max-height: 560px) and (min-aspect-ratio: 5/4) and (max-width: 420px) {
+      .pill {
+        padding: 2px 7px;
+        font-size: 11.5px;
+      }
+    }
+
+    @media (min-aspect-ratio: 5/4) and (min-width: 900px) and (min-height: 561px) {
+      .pill {
+        padding: 5px 13px;
+        font-size: 13.5px;
       }
     }
 
