@@ -20,6 +20,7 @@ import type { AvatarFrame, FramePath, FrameShape, Matrix } from '../render.ts';
 import type { AvatarDefinition } from '../types.ts';
 import type { Volume } from '../volume.ts';
 import { eyeBox, paintEye } from './eye.ts';
+import { paintMark } from './materials/marks.ts';
 import { canvasMaterialOf, type AvatarMaterial } from './materials/material.ts';
 
 /** A square in viewBox units. */
@@ -71,9 +72,12 @@ export function fitSquare(prev: Square | null, b: Bounds, cap: Square): Square {
 }
 
 interface Section {
+  d: string;
   box: FramePath['box'];
   path: Path2D;
   rule: CanvasFillRule;
+  /** A mark's part that is a ball or a capsule (see MarkPart.round). */
+  round: boolean;
 }
 
 const MAX_SECTIONS = 4096;
@@ -164,8 +168,10 @@ export function paintCanvas(surface: CanvasSurface, frame: AvatarFrame, size: nu
   const scale = (size / 100) * dpr;
   const layout = `${size}|${dpr}`;
   if (sections.size > MAX_SECTIONS) sections.clear();
-  for (const { id, d, evenOdd, box } of frame.paths) {
-    if (!sections.has(id)) sections.set(id, { box, path: new Path2D(d), rule: evenOdd ? 'evenodd' : 'nonzero' });
+  for (const { id, d, evenOdd, box, round } of frame.paths) {
+    // A mark's part may come with another outline under its id (a host's mark is its own code): then it is made anew.
+    const known = sections.get(id);
+    if (!known || known.d !== d || known.round !== (round === true)) sections.set(id, { d, box, path: new Path2D(d), rule: evenOdd ? 'evenodd' : 'nonzero', round: round === true });
   }
   const { matrices, bounds } = framePlacement(frame);
   const finish = canvasMaterialOf(material);
@@ -210,8 +216,8 @@ export function paintCanvas(surface: CanvasSurface, frame: AvatarFrame, size: nu
     if (shape.kind === 'slice') {
       const section = sections.get(shape.path) as Section;
       if (isMark(shape)) {
-        const painted = finish?.paintMark?.(ctx, section.box, scale, fill) ?? false;
-        if (!painted) ctx.fill(section.path, section.rule);
+        // In the material where it can draw the part, else as a plain fill.
+        if (!finish || !paintMark(finish, ctx, section, scale, fill)) ctx.fill(section.path, section.rule);
       } else if (!coat) {
         ctx.fill(section.path, section.rule);
       } else if (!coatPainted) {

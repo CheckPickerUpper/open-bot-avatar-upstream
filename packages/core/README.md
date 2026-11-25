@@ -35,7 +35,7 @@ avatar.destroy();
 | --- | --- |
 | `definition` | Required avatar definition. Validate imported data first. |
 | `color`, `eyeColor` | Body and eye colors as `#rgb` or `#rrggbb`, or any CSS color such as `var(--brand)`. Defaults: `#ff6a1a`, `#151515`. |
-| `state` | What the bot is doing: `"idle"` (default), `"thinking"`, `"working"`, `"waiting"`, `"blocked"` or `"done"`. Changes ease from the current pose. |
+| `state` | What the bot is doing: `"idle"` (default), `"thinking"`, `"working"`, `"waiting"`, `"blocked"` or `"done"`, or a [state of your own](#custom-states). Changes ease from the current pose. |
 | `mood` | How the bot feels: `"neutral"` (default) or `"happy"`. It shapes the eyes on top of any state, and the eyes morph from one shape to the next. `"idle"` and `"thinking"` are still accepted here and mean those states. |
 | `followPointer` | Follow the mouse, pen or finger on the page. Default: `false`. |
 | `lookAt` | Fixed `{ x, y }` direction, each from -1 to 1 (x right, y down). Overrides the pointer; `null` clears it. |
@@ -62,6 +62,74 @@ The six states are the ones an agent moves through. Each is motion on the same a
 | `done` | Celebrates: a few turns inside a cage of nine ribbons on three crossing hoops, then a rest, and after a while again. |
 
 A mood combines with any state: a bot can be working and happy. A happy bot keeps its arcs while it waits. The marks of `thinking` and `blocked` have no eyes, so a mood shows again when the body returns. Under reduced motion the ribbons are left out, the marks hold still and `done` does not turn.
+
+### Custom states
+
+The six names are one vocabulary. If your bot has a status they don't cover, pass a definition instead of a name. A definition is an `id` and a `pose` function that returns what differs from the resting pose:
+
+> **Experimental.** States and marks of your own are written against the renderer's own model of a pose (`Pose`, `StateContext`, `MarkPart`). Fields of these may be renamed or removed in a minor release while the API settles. The six names are stable.
+
+```ts
+import type { AvatarMark, AvatarStateDefinition } from "open-bot-avatar";
+
+// A mark is an id and the outlines it is made of, placed from the mark's center.
+// This one is a question mark: a hook over a dot, sized in `unit`.
+const question: AvatarMark = {
+  id: "question",
+  parts: ({ unit: u }) => {
+    const arc = (r: number, large: 0 | 1, sweep: 0 | 1, x: number, y: number) => `A${r * u} ${r * u} 0 ${large} ${sweep} ${x * u} ${y * u}`;
+    const hook =
+      `M${-0.26 * u} ${-0.062 * u}` + arc(0.26, 1, 1, 0.13, 0.163) + arc(0.08, 0, 0, 0.09, 0.232) + arc(0.09, 0, 1, -0.09, 0.232) +
+      arc(0.26, 0, 1, 0.04, 0.007) + arc(0.08, 1, 0, -0.08, -0.062) + arc(0.09, 0, 1, -0.26, -0.062) + "Z";
+    const w = 0.52 * u, h = 0.645 * u, r = 0.115 * u, gap = 0.1 * u;
+    const top = -(h + gap + 2 * r) / 2;
+    return [
+      { shape: "question-hook", d: hook, box: { x: -w / 2, y: -h / 2, w, h }, x: 0, y: top + h / 2, turn: 0, scale: 1 },
+      { shape: "question-dot", d: `M${r} 0A${r} ${r} 0 1 1 ${-r} 0A${r} ${r} 0 1 1 ${r} 0Z`, box: { x: -r, y: -r, w: 2 * r, h: 2 * r }, x: 0, y: -top - r, turn: 0, scale: 1 },
+    ];
+  },
+};
+
+// The body gives way to the mark: the bot needs an answer.
+const asking: AvatarStateDefinition = {
+  id: "asking",
+  pose: () => ({ marks: [{ mark: question, weight: 1 }] }),
+};
+
+// The body stays: calm as in idle, leaning, with narrowed eyes.
+const listening: AvatarStateDefinition = {
+  id: "listening",
+  pose: (ctx) => ({ ...ctx.rest(), roll: 6 + ctx.wave(4), squintL: 0.3, squintR: 0.3 }),
+};
+
+avatar.update({ state: asking });
+```
+
+A definition works wherever a state does: `mountAvatar`, `update`, the render functions and `createAnimator`. Changes to and from it ease like any other, and a mood shapes its eyes.
+
+- `id` names the state. Two definitions with the same `id` are the same state, so you can build a definition inline on every render without restarting it. The six names are taken: a definition with the `id` of one replaces it without easing.
+- `pose` receives a context with the clock (`t`, `wave`), the state's age (`stateAge`), the mood, `reducedMotion`, the resting pose (`base`) and the calm idle pose (`rest`). It must be a pure function of the context. Under `reducedMotion`, `t` is 0 and `wave` returns 0; a pose that uses neither holds still.
+- `startAge` is the age in seconds a state has when an avatar mounts in it. The default is 0.
+- A mark's `parts` are sized in `unit`, a share of the body's smaller side. Keep each outline the same from frame to frame, and animate a part with `x`, `y`, `turn` and `scale`: a live renderer keeps what it builds per outline.
+- A [material](#materials) draws every part in the shape of its outline: fur in `fluffy`, glass in `glass`. A part that is a circle or an upright capsule filling `box` can set `round: true` to be drawn from a ready ball, which is cheaper the first time.
+- Your code is held to what can be drawn. A pose field that is left out or is not a finite number keeps the resting pose's. A part without a `shape`, an outline `d` or a `box` with a size is left out, and a part's `x`, `y`, `turn` or `scale` that is not a finite number counts as 0, 0, 0 and 1. A `pose` or `parts` function that throws is not caught.
+- `stateDefinition("blocked")` returns the definition behind a name, to build a variant on.
+- `isState` and `resolveLook` read names only. Use them for values from links and storage; they never return a definition.
+
+To show the statuses of an agent protocol, map each status to a state in your own code:
+
+```ts
+import type { AvatarOptions } from "open-bot-avatar/dom";
+
+// The task states of the Model Context Protocol.
+const states: Record<string, AvatarOptions["state"]> = {
+  working: "working",
+  input_required: asking,
+  completed: "done",
+  failed: "blocked",
+  cancelled: "idle",
+};
+```
 
 ### Materials
 
