@@ -16,7 +16,7 @@
 import { createAnimator } from '../animator.ts';
 import { pointerGaze } from '../follow.ts';
 import { lookOf, type AvatarStateDefinition } from '../motion.ts';
-import { DEFAULT_COLOR, DEFAULT_EYE_COLOR, liveFrame, liveTransform, renderAvatarScene, renderAvatarSvg, sceneFrame, type SceneFrame } from '../render.ts';
+import { avatarFrame, DEFAULT_COLOR, DEFAULT_EYE_COLOR, liveFrame, liveTransform, renderAvatarFrameSvg, renderAvatarScene, sceneFrame, type SceneFrame } from '../render.ts';
 import type { AvatarDefinition, AvatarMood, AvatarState, RenderOptions } from '../types.ts';
 import { currentPointer, isHighRefresh, subscribeMountFrames } from './clock.ts';
 import { canvasMaterialOf, type AvatarMaterial } from './materials/material.ts';
@@ -310,7 +310,8 @@ export function mountAvatar(host: HTMLElement, initial: AvatarOptions): MountedA
           return false;
         }
         if (scene || surface) clear();
-        const svg = renderAvatarSvg(p.definition, options);
+        const frame = avatarFrame(p.definition, options);
+        const svg = renderAvatarFrameSvg({ ...frame, color: 'currentColor', ink: 'var(--avatar-ink)' });
         // The engine derives SVG ids from geometry, so repeated avatars can share them safely.
         if (svg !== lastStill) {
           host.innerHTML = svg;

@@ -97,6 +97,30 @@ describe('mountAvatar', () => {
     avatar.destroy();
   });
 
+  it('binds still SVG body and eye colors to the host, including CSS custom properties and happy strokes', async () => {
+    const el = document.createElement('div');
+    document.body.append(el);
+    const avatar = mountAvatar(el, {
+      definition: examples[2],
+      color: 'var(--brand)',
+      eyeColor: 'var(--ink)',
+      still: true,
+    });
+    await frame();
+    expect(el.style.color).toBe('var(--brand)');
+    expect(el.style.getPropertyValue('--avatar-ink')).toBe('var(--ink)');
+    expect(el.querySelector('svg > g')?.getAttribute('fill')).toBe('currentColor');
+    expect(el.querySelector('rect')?.getAttribute('fill')).toBe('var(--avatar-ink)');
+
+    avatar.update({ color: 'rebeccapurple', eyeColor: 'navy', mood: 'happy' });
+    await frame();
+    expect(el.style.color).toBe('rebeccapurple');
+    expect(el.style.getPropertyValue('--avatar-ink')).toBe('navy');
+    expect(el.querySelector('svg > g')?.getAttribute('fill')).toBe('currentColor');
+    expect(el.querySelector('path[stroke]')?.getAttribute('stroke')).toBe('var(--avatar-ink)');
+    avatar.destroy();
+  });
+
   it('reports an invalid definition once instead of throwing', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const el = document.createElement('div');

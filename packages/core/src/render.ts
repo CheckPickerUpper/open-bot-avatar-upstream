@@ -842,6 +842,14 @@ function ribbonSvg(d: string, g: RibbonGradient): string {
 /** Render a definition to a standalone SVG string. Throws if the definition is invalid. */
 export function renderAvatarSvg(definition: AvatarDefinition, options: RenderOptions = {}): string {
   const frame = avatarFrame(definition, options);
+  return renderAvatarFrameSvg(frame, options.size);
+}
+
+/**
+ * Serialize a prepared avatar frame as an SVG string. Internal to the SVG renderers; DOM mounts
+ * supply inherited CSS colors (`currentColor` and `var(--avatar-ink)`).
+ */
+export function renderAvatarFrameSvg(frame: AvatarFrame, width?: number): string {
   // A mark's outline is the host's own text: it is escaped. Every other path is serialized from numbers.
   const defsMarkup = frame.paths.map((d) => `<path id="${d.id}" d="${esc(d.d)}"${d.evenOdd ? ' fill-rule="evenodd"' : ''}/>`).join('');
   const body = frame.shapes
@@ -851,7 +859,7 @@ export function renderAvatarSvg(definition: AvatarDefinition, options: RenderOpt
       : `<g transform="${mat(s.matrix)}">${ribbonSvg(s.d, s.gradient)}</g>`,
     )
     .join('');
-  const size = Number.isFinite(options.size) && (options.size as number) > 0 ? f(clamp(options.size as number, 8, 4096)) : null;
+  const size = width !== undefined && Number.isFinite(width) && width > 0 ? f(clamp(width, 8, 4096)) : null;
   const dims = size ? ` width="${size}" height="${size}"` : '';
   const label = esc(frame.name);
 
